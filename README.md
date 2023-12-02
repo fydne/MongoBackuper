@@ -1,6 +1,6 @@
 <p>
 <a href="#">
-<img src="https://raw.githubusercontent.com/fydne/MongoBackuper/main/bins/build.ico" width="128px" align="right" style="border-radius: 50%;" />
+<img src="https://raw.githubusercontent.com/fydne/MongoBackuper/master/bins/build.ico" width="128px" align="right" style="border-radius: 50%;" />
 </a>
 
 # Mongo Backuper
