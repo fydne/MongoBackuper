@@ -1,6 +1,6 @@
 [package]
 name = "mongo_backuper"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Create backups of MongoDB"
 license = "MIT"
@@ -19,3 +19,11 @@ futures-util = "0.3.29"
 [build-dependencies]
 winres = "0.1"
 time = "0.3.30"
+
+[profile.release]
+lto = true
+opt-level = "s"
+debug = false
+panic = "abort"
+strip = "symbols"
+codegen-units = 1

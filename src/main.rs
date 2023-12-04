@@ -3,7 +3,7 @@ use bson::RawDocumentBuf;
 use serde::{Deserialize, Serialize};
 use mongodb::Client;
 use time::{OffsetDateTime, Date, Time, Month};
-use std::{path::Path, fs::{self, File}, io::Write};
+use std::{path::Path, fs::{self, File}, io::Write, process};
 use tokio::time::{sleep, Duration};
 
 mod logger;
@@ -25,7 +25,7 @@ pub struct ConfigConnect {
 }
 
 fn main() {
-    logger::debug("MongoDB Backuper started");
+    logger::info("MongoDB Backuper started");
 
     if !Path::new(&DIRECTORY).exists() {
         logger::debug("MongoDB directory not found. Creating...");
@@ -60,7 +60,7 @@ fn main() {
         return;
     }
 
-    let config_data = normalize_config_file(config_pre_data.unwrap());
+    let config_data = normalize_config_file(config_pre_data.unwrap_or_default());
     let pre_cfg = serde_json::from_str(&config_data);
     let config: Vec<ConfigConnect> = match pre_cfg {
         Ok(res) => res,
@@ -92,7 +92,15 @@ fn main() {
     }
 
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(res) => res,
+        Err(err) => {
+            logger::error_string(format!("Failed to create tokio runtime: {err}"));
+            close_proc();
+            return;
+        }
+    };
+
     rt.block_on(async {
         let futures = FuturesUnordered::from_iter(procs);
         futures.collect::<()>().await;
@@ -104,11 +112,20 @@ fn main() {
 }
 
 fn close_proc() {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(res) => res,
+        Err(err) => {
+            logger::error_string(format!("Failed to create tokio runtime in close_proc(): {err}"));
+            return;
+        }
+    };
+
     rt.block_on(async {
         logger::warn("Window will be closed after 5 seconds");
         sleep(Duration::from_secs(5)).await;
     });
+
+    process::exit(0x0100);
 }
 
 

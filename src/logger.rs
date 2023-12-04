@@ -1,3 +1,7 @@
+pub fn info(content: &str) {
+    println!("[{}] {} {content}", crate::exts::get_date(), colors::blue("{Info}"));
+}
+
 pub fn warn(content: &str) {
     println!("[{}] {} {content}", crate::exts::get_date(), colors::yellow("{Warn}"));
 }
