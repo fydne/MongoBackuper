@@ -1,11 +1,4 @@
-use futures_util::{StreamExt, stream::FuturesUnordered};
-use bson::RawDocumentBuf;
-use serde::{Deserialize, Serialize};
-use mongodb::Client;
-use time::{OffsetDateTime, Date, Time, Month};
-use std::{path::Path, fs::{self, File}, io::Write, process};
-use tokio::time::{sleep, Duration};
-
+mod backuper;
 mod logger;
 mod exts;
 
@@ -15,400 +8,288 @@ const DIRECTORY: &'static str = "/MongoBackups";
 #[cfg(target_os = "windows")]
 const DIRECTORY: &'static str = "C:\\MongoBackups";
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ConfigConnect {
-    pub name: String,
-    pub url: String,
-    pub interval: f64,
-    #[serde(rename = "removeOld")]
-    pub remove_old: f64,
-}
 
+
+#[cfg(not(target_os = "windows"))]
 fn main() {
-    logger::info("MongoDB Backuper started");
+    loop {
+        println!("{} Write command... // Write \"help\" to get commands", logger::colors::green("{INPUT}"));
 
-    if !Path::new(&DIRECTORY).exists() {
-        logger::debug("MongoDB directory not found. Creating...");
-
-        let result = fs::create_dir_all(&DIRECTORY);
-
-        if result.is_err() {
-            logger::error_string(format!("Failed to create directory for MongoDB Backups at {}", &DIRECTORY));
-            close_proc();
-            return;
-        }
-    }
-
-    let config_path = Path::new(&DIRECTORY).join("config.js");
-
-    if !config_path.exists() {
-        logger::debug("Config file not found. Creating...");
-
-        let result = fs::write(&config_path, get_config_example());
-
-        if result.is_err() {
-            logger::error("Failed to create config file");
-            close_proc();
-            return;
-        }
-    }
-
-    let config_pre_data = fs::read_to_string(&config_path);
-    if config_pre_data.is_err() {
-        logger::error("Failed to read config file");
-        close_proc();
-        return;
-    }
-
-    let config_data = normalize_config_file(config_pre_data.unwrap_or_default());
-    let pre_cfg = serde_json::from_str(&config_data);
-    let config: Vec<ConfigConnect> = match pre_cfg {
-        Ok(res) => res,
-        Err(err) => {
-            logger::error_string(err.to_string());
-            close_proc();
-            return;
-        },
-    };
-
-    logger::debug_string(format!("Collections count: {}", config.len()));
-
-    if config.len() == 0 {
-        logger::error("Config doesn't have MongoDB connections");
-        close_proc();
-        return;
-    }
-
-    let mut procs = Vec::new();
-    for cfg_connect in config {
-        let task = async move {
-            loop {
-                backup(&cfg_connect).await;
-                sleep(Duration::from_secs((&cfg_connect.interval * 3600 as f64) as u64)).await;
+        let readed = exts::read_line();
+        match readed.as_str() {
+            "help" => {
+                logger::info("Command list:");
+                logger::info("| help - Get a list of commands");
+                logger::info("| run - Run the backup script");
+                logger::info("| quit - Close the app");
             }
-        };
-        let task = Box::pin(task);
-        procs.push(task);
+            "run" => {
+                backuper::run();
+            }
+            "quit" => {
+                exts::close_proc();
+            }
+            _ => {
+                logger::warn_string(format!("Unknow command: {readed}"));
+            }
+        }
     }
-
-
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(res) => res,
-        Err(err) => {
-            logger::error_string(format!("Failed to create tokio runtime: {err}"));
-            close_proc();
-            return;
-        }
-    };
-
-    rt.block_on(async {
-        let futures = FuturesUnordered::from_iter(procs);
-        futures.collect::<()>().await;
-    });
-
-    logger::warn("All processes of backup have been stopped");
-
-    close_proc();
-}
-
-fn close_proc() {
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(res) => res,
-        Err(err) => {
-            logger::error_string(format!("Failed to create tokio runtime in close_proc(): {err}"));
-            return;
-        }
-    };
-
-    rt.block_on(async {
-        logger::warn("Window will be closed after 5 seconds");
-        sleep(Duration::from_secs(5)).await;
-    });
-
-    process::exit(0x0100);
 }
 
 
-async fn backup(config: &ConfigConnect) {
-    if config.interval < 0.05 {
-        logger::warn_string(format!("Interval can not be lower than 0.05 [3 min] ({}) of \"${}\"", &config.interval, &config.name));
-        return;
+
+#[cfg(target_os = "windows")]
+const SERVICENAME: &'static str = "mongo_backuper";
+
+#[cfg(target_os = "windows")]
+#[macro_use]
+extern crate windows_service;
+
+#[cfg(target_os = "windows")]
+use {
+    tokio::time::Duration,
+    std::{path::Path, fs, process, ffi::OsString},
+    windows_service::service_dispatcher,
+    windows_service::service_control_handler::{self, ServiceControlHandlerResult},
+    windows_service::service_manager::{ServiceManager, ServiceManagerAccess},
+    windows_service::service::{
+        ServiceControl, ServiceInfo, ServiceType, 
+        ServiceStartType, ServiceAccess, ServiceErrorControl, 
+        ServiceState, ServiceStatus, ServiceControlAccept, ServiceExitCode
     }
+};
 
-    let root_dir_path = Path::new(&DIRECTORY).join("Backups").join(&config.name);
+#[cfg(target_os = "windows")]
+define_windows_service!(ffi_service_main, service_init);
 
-    delete_old_dirs(&root_dir_path, &config);
+#[cfg(target_os = "windows")]
+fn service_init(arguments: Vec<OsString>) {
+    if let Err(err) = service_run(arguments) {
+        logger::error_string(format!("Service Init: {err}"));
+    }
+}
 
-    logger::info_string(format!("Backing up the collection \"{}\" has been started", &config.name));
+#[cfg(target_os = "windows")]
+fn service_run(_: Vec<OsString>) -> Result<(), windows_service::Error> {
 
-    let dir_path = Path::new(&root_dir_path).join(exts::get_date_file());
+    let event_handler = move | control_event | -> ServiceControlHandlerResult {
+        match control_event {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                process::exit(0x0000);
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+
+    let status_handle = service_control_handler::register(SERVICENAME, event_handler)?;
+
+    let proccess_id: Option<u32> = Some(process::id());
+    let service_status = ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: proccess_id,
+    };
     
-    if dir_path.exists() {
-        fs::remove_dir_all(&dir_path).unwrap_or_default();
-    }
+    status_handle.set_service_status(service_status)?;
 
-    match fs::create_dir_all(&dir_path) {
-        Ok(_) => {},
-        Err(err) => {
-            logger::warn_string(
-                format!("Failed to create directory: {} > {}",
-                dir_path.to_str().unwrap_or_default(), err.to_string())
-            );
-            return;
-        }
-    }
+    backuper::run();
+    
+    Ok(())
+}
 
-    let pre_client = Client::with_uri_str(&config.url).await;
-    let client = match pre_client {
-        Ok(res) => res,
-        Err(err) => {
-            logger::error_string(err.to_string());
-            return;
-        }
-    };
+#[cfg(target_os = "windows")]
+fn main() -> Result<(), windows_service::Error> {
+    let mut run_dir = format!("{}", std::env::var("USERPROFILE").unwrap_or_default());
+    run_dir.remove(0);
 
-    let pre_databases = client.list_database_names(None, None).await;
-    let databases = match pre_databases {
-        Ok(res) => res,
-        Err(err) => {
-            logger::error_string(err.to_string());
-            return;
-        }
-    };
+    if run_dir.starts_with(":\\WINDOWS\\system32") {
+        service_dispatcher::start(SERVICENAME, ffi_service_main)?;
+    } else {
+        loop {
+            println!("{} Write command... // Write \"help\" to get commands", logger::colors::green("{INPUT}"));
 
-    for db_name in databases {
-        if db_name == "config" || db_name == "local" {
-            continue;
-        }
-        
-        let db = client.database(&db_name);
-
-        let pre_collections = db.list_collection_names(None).await;
-        let collections = match pre_collections {
-            Ok(res) => res,
-            Err(err) => {
-                logger::error_string(err.to_string());
-                continue;
-            }
-        };
-
-        let db_dir_path = Path::new(&dir_path).join(&db_name);
-        
-        if db_dir_path.exists() {
-            fs::remove_dir_all(&db_dir_path).unwrap_or_default();
-        }
-
-        match fs::create_dir_all(&db_dir_path) {
-            Ok(_) => {},
-            Err(err) => {
-                logger::warn_string(
-                    format!("Failed to create directory: {} > {}",
-                    db_dir_path.to_str().unwrap_or_default(), err.to_string())
-                );
-                continue;
-            }
-        }
-
-        logger::debug_string(format!("Creating Backup of \"{db_name}\" in \"{}\"", &config.name));
-
-        for collection_name in collections {
-            let collection = db.collection::<RawDocumentBuf>(&collection_name);
-
-            let cursor = match collection.find(None, None).await {
-                Ok(cursor) => cursor,
-                Err(_) => continue,
-            };
-
-            let pre_file = File::create(Path::new(&db_dir_path).join(format!("{collection_name}.bson")));
-            let mut file = match pre_file {
-                Ok(f) => f,
-                Err(err) => {
-                    format!("Failed to create file for collection \"{}\" > {}",
-                    collection_name, err.to_string());
-                    continue;
+            let readed = exts::read_line();
+            match readed.as_str() {
+                "help" => {
+                    logger::info("Command list:");
+                    logger::info("| help - Get a list of commands");
+                    logger::info("| install - Install a service for automatic backups");
+                    logger::info("| uninstall - Remove a service for automatic backups");
+                    logger::info("| restart - Restart a service for automatic backups");
+                    logger::info("| run - Run the backup script");
+                    logger::info("| quit - Close the app");
                 }
-            };
-            
-            let docs = cursor.collect::<Vec<_>>().await;
-            for pre_doc in &docs {
-                match pre_doc {
-                    Ok(doc) => {
-                        _ = file.write_all(doc.as_bytes()).unwrap_or_default();
-                    },
-                    Err(_) => {}
-                }
-            }
-        }
-    };
-
-    logger::info_string(format!("Backup of the collection \"{}\" completed", &config.name));
-}
-
-
-fn get_config_example() -> &'static str {
-r#"[
-    {
-        "name": "mydb", // The name of the database (for the backup directory), can be arbitrary
-        "url": "mongodb://localhost", // Link-connect to MongoDB
-        "interval": 4, // Sets the interval for database backup (in hours)
-        "removeOld": 30 // Automatically deletes old backups that exceed the specified number of backups (In days) *But keeps one backup in any occasions.
-    },
-    { // To backup multiple databases
-        "name": "mydb2",
-        "url": "mongodb://user:password@host:port",
-        "interval": 12,
-        "removeOld": 15
-    }
-]"#
-}
-
-fn normalize_config_file(content: String) -> String {
-    let mut res = String::new();
-    let arr = content.split('\n');
-
-    for cont in arr {
-        let parse_cont: Vec<_> = cont.split(" // ").collect();
-        if let Some(first) = parse_cont.first() {
-            //res.push_str(first.trim());
-            res.push_str(format!("{first}\n").as_str());
-        }
-    }
-
-    return res;
-}
-
-fn delete_old_dirs(root_dir_path: &Path, config: &ConfigConnect) {
-    if root_dir_path.exists() {
-        logger::debug_string(format!("Checking and deleting old backups of \"{}\"", &config.name));
-
-        let mut files_vec: Vec<String> = Vec::new();
-
-        match fs::read_dir(&root_dir_path) {
-            Ok(files) => {
-                for file in files {
-                    match file {
-                        Ok(file_name) => {
-                            let name = file_name.file_name().into_string().unwrap_or_default();
-
-                            match fs::remove_dir(Path::new(&root_dir_path).join(&name)) {
-                                Ok(_) => continue,
-                                Err(_) => {}
-                            }
-
-                            if !name.contains(".") || !name.contains(" ") || !name.contains("-") {
-                                continue;
-                            }
-
-                            files_vec.push(name);
-                        },
+                "install" => {
+                    let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
+                    let service_manager = match ServiceManager::local_computer(None::<&str>, manager_access) {
+                        Ok(res) => res,
                         Err(err) => {
-                            logger::debug_string(err.to_string());
+                            logger::warn_string(format!("Failed to create a ServiceManager session: {err}"));
+                            continue;
+                        }
+                    };
+
+                    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+                    if let Ok(service) = service_manager.open_service(SERVICENAME, service_access) {
+                        if let Err(err) = service.delete() {
+                            logger::warn_string(format!("Failed to delete old service: {err}"));
+                        }
+                        match service.query_status() {
+                            Ok(status) => {
+                                if status.current_state != ServiceState::Stopped {
+                                    if let Err(err) = service.stop() {
+                                        logger::warn_string(format!("Failed to stop old service: {err}"));
+                                    }
+                                }
+                            },
+                            Err(err) => {
+                                logger::warn_string(format!("Failed to get current status of old service: {err}"));
+                            }
                         }
                     }
-                }
-            },
-            Err(err) => {
-                logger::debug_string(err.to_string());
-            }
-        }
 
-        for name in files_vec {
+                    
+                    let service_file_path = Path::new("C:\\ProgramData\\MongoBackuper");
 
-            match fs::read_dir(&root_dir_path) {
-                Ok(files) => {
-                    if files.count() < 2 {
-                        return;
+                    if service_file_path.exists() {
+                        if let Err(err) = fs::remove_dir_all(service_file_path) {
+                            logger::warn_string(format!("Error when deleting a exists directory: {err}"));
+                        }
                     }
-                },
-                Err(_) => {}
-            }
 
-            let arr1: Vec<_> = name.split(' ').collect();
-            
-            let year: i32;
-            let month: Month;
-            let day: u8; 
-            let hours: u8;
-            let minutes: u8;
-
-            if let Some(first) = arr1.first() {
-                let local_arr: Vec<_> = first.trim().split('.').collect();
-
-                if let Some(hrs) = local_arr.first() {
-                    day = hrs.to_string().parse::<u8>().unwrap_or_default();
-                } else {
-                    continue;
-                }
-
-                if local_arr.len() > 1 {
-                    let pre_mnth = local_arr[1];
-                    let pre_mnth = pre_mnth.to_string().parse::<u8>().unwrap_or_default();
-                    month = match pre_mnth {
-                        1 => Month::January,
-                        2 => Month::February,
-                        3 => Month::March,
-                        4 => Month::April,
-                        5 => Month::May,
-                        6 => Month::June,
-                        7 => Month::July,
-                        8 => Month::August,
-                        9 => Month::September,
-                        10 => Month::October,
-                        11 => Month::November,
-                        12 => Month::December,
-                        _ => Month::January,
+                    if let Err(err) = fs::create_dir_all(service_file_path) {
+                        logger::warn_string(format!("Error when creating a directory: {err}"));
+                        continue;
                     }
-                } else {
-                    continue;
+
+                    let current_path = match std::env::current_exe() {
+                        Ok(path) => path,
+                        Err(err) => {
+                            logger::warn_string(format!("Error when getting the location of the current file: {err}"));
+                            continue;
+                        }
+                    };
+                    
+                    let exec_file_path = service_file_path.join("MongoBackuper.exe");
+                    if let Err(err) = fs::copy(current_path, &exec_file_path) {
+                        logger::warn_string(format!("Error when copying a file: {err}"));
+                        continue;
+                    }
+
+                    
+                    let service_info = ServiceInfo {
+                        name: OsString::from(SERVICENAME),
+                        display_name: OsString::from("MongoBackuper"),
+                        service_type: ServiceType::OWN_PROCESS,
+                        start_type: ServiceStartType::AutoStart,
+                        error_control: ServiceErrorControl::Normal,
+                        executable_path: exec_file_path,
+                        launch_arguments: vec![],
+                        dependencies: vec![],
+                        account_name: None,
+                        account_password: None,
+                    };
+
+                    let service_open_access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
+                    let service = match service_manager.create_service(&service_info, service_open_access) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            logger::warn_string(format!("Failed to create service: {err}"));
+                            continue;
+                        }
+                    };
+
+                    let args: [OsString; 0] = [];
+                    if let Err(err) = service.start(&args) {
+                        logger::warn_string(format!("Failed to start service: {err}"));
+                    }
+
+                    if let Err(err) = service.set_description("Create backups of MongoDB") {
+                        logger::warn_string(format!("Failed to change service desc: {err}"));
+                    }
+
+                    logger::info("Service created");
                 }
+                "uninstall" => {
+                    let manager_access = ServiceManagerAccess::CONNECT;
+                    let service_manager = match ServiceManager::local_computer(None::<&str>, manager_access) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            logger::warn_string(format!("Failed to create a ServiceManager session: {err}"));
+                            continue;
+                        }
+                    };
 
-                if let Some(min) = local_arr.last() {
-                    year = min.to_string().parse::<i32>().unwrap_or_default();
-                } else {
-                    continue;
+                    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+                    if let Ok(service) = service_manager.open_service(SERVICENAME, service_access) {
+                        if let Err(err) = service.delete() {
+                            logger::warn_string(format!("Failed to delete service: {err}"));
+                        }
+                        match service.query_status() {
+                            Ok(status) => {
+                                if status.current_state != ServiceState::Stopped {
+                                    if let Err(err) = service.stop() {
+                                        logger::warn_string(format!("Failed to stop service: {err}"));
+                                    }
+                                }
+                            },
+                            Err(err) => {
+                                logger::warn_string(format!("Failed to get current status of service: {err}"));
+                            }
+                        }
+                    }
+
+                    let service_file_path = Path::new("C:\\ProgramData\\MongoBackuper");
+                    
+                    if service_file_path.exists() {
+                        if let Err(err) = fs::remove_dir_all(service_file_path) {
+                            logger::warn_string(format!("Error when deleting a exists directory: {err}"));
+                        }
+                    }
+
+                    logger::info("Service deleted");
                 }
-            } else {
-                continue;
-            }
-            
-            if let Some(last) = arr1.last() {
-                let local_arr: Vec<_> = last.trim().split('-').collect();
+                "restart" => {
+                    let manager_access = ServiceManagerAccess::CONNECT;
+                    let service_manager = match ServiceManager::local_computer(None::<&str>, manager_access) {
+                        Ok(res) => res,
+                        Err(err) => {
+                            logger::warn_string(format!("Failed to create a ServiceManager session: {err}"));
+                            continue;
+                        }
+                    };
 
-                if let Some(hrs) = local_arr.first() {
-                    hours = hrs.to_string().parse::<u8>().unwrap_or_default();
-                } else {
-                    continue;
+                    let service_access = ServiceAccess::STOP | ServiceAccess::START;
+                    if let Ok(service) = service_manager.open_service(SERVICENAME, service_access) {
+                        if let Err(err) = service.stop() {
+                            logger::warn_string(format!("Failed to stop service: {err}"));
+                        }
+
+                        let args: [OsString; 0] = [];
+                        if let Err(err) = service.start(&args) {
+                            logger::warn_string(format!("Failed to start service: {err}"));
+                        }
+                    }
+
+                    logger::info("Service restarted");
                 }
-
-                if let Some(min) = local_arr.last() {
-                    minutes = min.to_string().parse::<u8>().unwrap_or_default();
-                } else {
-                    continue;
+                "run" => {
+                    backuper::run();
                 }
-            } else {
-                continue;
-            }
-            
-            let date = match Date::from_calendar_date(year, month, day) {
-                Ok(res) => res,
-                Err(_) => continue
-            };
-            let time = match Time::from_hms(hours, minutes, 00) {
-                Ok(res) => res,
-                Err(_) => continue
-            };
-
-            let mut datetime = OffsetDateTime::now_utc();
-            datetime = datetime.replace_date(date);
-            datetime = datetime.replace_time(time);
-
-            let unix = OffsetDateTime::now_local().unwrap_or(OffsetDateTime::now_utc());
-
-            let total = unix.unix_timestamp() - datetime.unix_timestamp();
-            if total > (config.remove_old * 86400 as f64) as i64 { // 60 * 60 * 24
-                logger::debug_string(format!("Removing directory \"{name}\" of \"{}\"", &config.name));
-                fs::remove_dir_all(Path::new(&root_dir_path).join(&name)).unwrap_or_default();
+                "quit" => {
+                    exts::close_proc();
+                }
+                _ => {
+                    logger::warn_string(format!("Unknow command: {readed}"));
+                }
             }
         }
     }
+
+    return Ok(());
 }

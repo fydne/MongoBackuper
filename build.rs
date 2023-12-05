@@ -9,6 +9,7 @@ fn main() -> std::io::Result<()> {
         .set("OriginalFilename", "MongoBackuper.exe")
         .set("FileDescription", "Create backups of MongoDB")
         .set("LegalCopyright", format!("Copyright © fydne {}", OffsetDateTime::now_utc().year()).as_str())
+        .set_manifest_file("./bins/installer_manifest.xml")
         .compile()
         .unwrap();
 
